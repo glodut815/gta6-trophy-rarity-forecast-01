@@ -19,6 +19,12 @@ Model (written for this entry, standard library only):
     refreshes it). On those states, log E (per trophy) and log N are each
     fitted against x by recency-weighted least squares, then read at the
     target's x. The median rate is 100 * exp(log E* - log N*).
+  * Each trophy's earned-count slope is shrunk toward the median slope
+    across trophies (partial pooling): with few distinct states a single
+    trophy's slope is mostly noise, so it borrows strength from the pack,
+    and with many states it mostly keeps its own slope. The shrink pivots
+    on the fit's centroid, so the level is untouched and only the trend is
+    pulled in. Steadying the medians is where pinball loss is won or lost.
   * When the history is flat (a single distinct state, as on launch night),
     no slope can be fitted. The prior then is one refresh before the
     target: Exophase's first refresh multiplied the tracked players about
@@ -186,16 +192,15 @@ def forecast_case(case):
     last_rates = last["rates"]
     last_n = float(last["players_tracked"])
 
-    medians = {}
-    sigmas = {}
-    for idx, trophy in enumerate(trophies):
-        rate_last = last_rates[idx]
-        if rate_last is None:
-            rate_last = fallback_rate(trophies, last_rates, trophy)
-        earned_last = max(0.0, rate_last) * last_n / 100.0
-
-        if len(states) > 1:
-            # Per-trophy earned counts across the distinct states.
+    # First pass: fit each trophy's earned counts, then pool the slopes.
+    # A single trophy's slope from a handful of states is mostly noise, so
+    # the second pass shrinks every slope toward the median slope across
+    # trophies (partial pooling), weighted by how many states the trophy
+    # has: (m - 1) / m keeps its own slope, 1 / m borrows the pack's.
+    fits = {}
+    b_pool = 0.0
+    if len(states) > 1:
+        for idx in range(len(trophies)):
             ys_e = []
             xs_e = []
             ws_e = []
@@ -209,11 +214,38 @@ def forecast_case(case):
                 ws_e.append(weights[j])
             if len(ys_e) > 1:
                 a_e, b_e, xbar_e, sxx_e, resid_e = weighted_line(xs_e, ys_e, ws_e)
-                log_e_star = a_e + b_e * x_target
+                fits[idx] = (a_e, b_e, xbar_e, sxx_e, resid_e, len(ys_e))
+        slopes = sorted(f[1] for f in fits.values())
+        if slopes:
+            mid = len(slopes) // 2
+            if len(slopes) % 2:
+                b_pool = slopes[mid]
+            else:
+                b_pool = 0.5 * (slopes[mid - 1] + slopes[mid])
+        else:
+            b_pool = b_n
+
+    medians = {}
+    sigmas = {}
+    for idx, trophy in enumerate(trophies):
+        rate_last = last_rates[idx]
+        if rate_last is None:
+            rate_last = fallback_rate(trophies, last_rates, trophy)
+        earned_last = max(0.0, rate_last) * last_n / 100.0
+
+        if len(states) > 1:
+            if idx in fits:
+                a_e, b_e, xbar_e, sxx_e, resid_e, m_e = fits[idx]
+                # Shrink this trophy's slope toward the pooled slope,
+                # pivoting on the fit's centroid so the level is untouched.
+                ybar_e = a_e + b_e * xbar_e
+                w_e = (m_e - 1) / m_e
+                b_e = w_e * b_e + (1.0 - w_e) * b_pool
+                log_e_star = ybar_e + b_e * (x_target - xbar_e)
                 # Prediction leverage of the target point.
                 leverage = (x_target - xbar_e) ** 2 / sxx_e if sxx_e > 0 else 0.0
                 sigma_fit = math.sqrt(resid_e**2 + resid_n**2)
-                sigma_fit *= math.sqrt(1.0 + leverage + 1.0 / max(1, len(xs_e)))
+                sigma_fit *= math.sqrt(1.0 + leverage + 1.0 / max(1, m_e))
                 sigma_fit = min(sigma_fit, 1.5)
             else:
                 log_e_star = math.log(max(0.5, earned_last))
